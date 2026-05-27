@@ -12,6 +12,8 @@ Aleksi Eeben, the author of EB Electric Drum, once answered my
 request for source code with "It's a good practice — go program it
 yourself." With DMGARP I finally did it.
 
+**[Download latest ROM (V37.1)](https://github.com/kennhartwig/dmgarp/releases/latest/download/dmg-arp.gb)**
+
 ---
 
 ## Features
