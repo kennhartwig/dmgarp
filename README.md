@@ -1,6 +1,6 @@
 # DMGARP
 
-A modal arpeggiator instrument for the original 1989 DMG Game Boy,
+A modal arpeggiator instrument for the original 1989 Nintendo GameBoy DMG,
 written in RGBDS assembly, tuned for live performance. It runs as a
 self-contained 32 KB ROM on real hardware or any accurate emulator.
 Four sound channels, ten pages of live-editable parameters, 28 scale
