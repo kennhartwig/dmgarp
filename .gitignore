@@ -1,0 +1,5 @@
+build/
+roms/
+downloads/
+tools/
+*.sav
