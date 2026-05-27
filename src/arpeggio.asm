@@ -9538,7 +9538,7 @@ TonalMap_TRK:
     db $16, $15, $14, $13, $12, $11, $10, $07, $06, $05, $04, $00
 
 TonalMap_GML:
-    ; 12 hand-picked NR43 values across the chromatic — "the gamelan voicing".
+    ; 12 selected NR43 values across the chromatic — "the gamelan voicing".
     ; Seed: clusters of similar pitches, picking a coherent metallic palette.
     ; Entry 0 lifted from $44 → $36 after on-device tuning: $44 (clock-shift 4)
     ; produced sub-tonal rumble in 7B mode instead of a pitched ping. $36 sits
@@ -9547,7 +9547,7 @@ TonalMap_GML:
     db $36, $42, $40, $35, $33, $31, $25, $23, $21, $15, $13, $11
 
 TonalMap_INV:
-    ; Inverted: high note = low pitch (NR43 ascending). Hand-tuned, not auto-mirrored.
+    ; Inverted: high note = low pitch (NR43 ascending). Custom mapping, not auto-mirrored.
     db $00, $04, $05, $06, $07, $10, $11, $12, $13, $14, $15, $16
     db $17, $20, $21, $22, $23, $24, $25, $26, $27, $30, $31, $32
     db $33, $34, $35, $36, $37, $40, $41, $42, $43, $44, $45, $46
