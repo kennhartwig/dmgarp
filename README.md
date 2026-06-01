@@ -8,7 +8,7 @@ banks spanning church modes, harmonic-minor modes, Messiaen modes,
 and Ethiopian pentatonic scales. All parameters take effect
 immediately — no menus to commit.
 
-Aleksi Eeben, the author of EB Electric Drum, once answered my
+Aleksi Eeben, the author of GB Electric Drum, once answered my
 request for source code with "It's a good practice — go program it
 yourself." With DMGARP I finally did it.
 
