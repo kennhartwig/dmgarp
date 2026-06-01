@@ -9,7 +9,7 @@ and Ethiopian pentatonic scales. All parameters take effect
 immediately — no menus to commit.
 
 Aleksi Eeben, the author of GB Electric Drum, once answered my
-request for source code with "It's a good practice — go program it
+request for source code with "It's a good practice. Go program it
 yourself." With DMGARP I finally did it.
 
 **[Download latest ROM (V37.1)](https://github.com/kennhartwig/dmgarp/releases/latest/download/dmg-arp.gb)**
