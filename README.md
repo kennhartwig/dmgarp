@@ -24,10 +24,10 @@ yourself." With DMGARP I finally did it.
 
 | Family | Banks |
 |--------|-------|
-| Church modes | Ionian, Dorian, Phrygian, Lydian, Mixolydian, Aeolian, Locrian
-| Harmonic minor modes | Harmonic Minor, Locrian ♮6, Ionian ♯5, Dorian ♯11, Phrygian Dominant, Lydian ♯2, Super Locrian
-| Messiaen modes | Whole Tone, Octatonic, and modes 3–7
-| Ethiopian pentatonic | Tizita Maj/Min, Bati Maj/Min, Ambassel, Anchihoye, Yematibela
+| Church modes | Ionian, Dorian, Phrygian, Lydian, Mixolydian, Aeolian, Locrian |
+| Harmonic minor modes | Harmonic Minor, Locrian ♮6, Ionian ♯5, Dorian ♯11, Phrygian Dominant, Lydian ♯2, Super Locrian |
+| Messiaen modes | Whole Tone, Octatonic, and modes 3–7 |
+| Ethiopian pentatonic | Tizita Maj/Min, Bati Maj/Min, Ambassel, Anchihoye, Yematibela |
 
 ### Arpeggiator engine
 
