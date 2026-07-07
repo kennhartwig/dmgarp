@@ -282,14 +282,41 @@ a real instrument.
   3. `EuclidKickClampAfterN` — clamps `wEuclidKickK` to [0,N], `wEuclidKickRot` to [0,N-1], and resets `wEuclidKickStep` to 0. The step counter is not saved (it is runtime state); if the pre-load value exceeds the loaded N, the step-advance check (`cp N / jr z, .wrap`) never fires because it tests for exact equality — the kick lane goes permanently silent.
 
 ### Per-field range validation on SRAM read (V30.2)
-- `ValidateSlot` runs a read-only pass over 46 SRAM param bytes before any WRAM writes occur. It compares each byte against a parallel `SaveParamRangeTable` (92 bytes: 46 × `db min, max`). The table order must exactly mirror `SaveParamTable`. `SAVE_PARAM_COUNT EQU 46` keeps them in sync — update this constant whenever a param is added.
+- `ValidateSlot` runs a read-only pass over all `SAVE_PARAM_COUNT` (61 as of V38) SRAM param bytes before any WRAM writes occur. It compares each byte against a parallel `SaveParamRangeTable` (61 × `db min, max`). The table order must exactly mirror `SaveParamTable`. the `SAVE_PARAM_COUNT` constant keeps them in sync — update this constant whenever a param is added.
 - If any byte fails, `LoadSlot` clears the occupied flag in SRAM and returns `a=0` to its caller; WRAM is untouched. The caller shows "EMPTY SLOT" and redraws the slot list. This prevents corrupted SRAM from hanging the ROM (wStride=0 → infinite loop in ComputeNoteCount).
 - Register trick: during the validation loop, `b` = iteration count, `c` = byte under test (loaded via `ld a, [hli] / ld c, a`), `de` = range table cursor, `hl` = SRAM byte cursor. No push/pop inside the loop. The `cp c` instruction checks `a - c` unsigned; for min check, `jr c` passes if min < byte, `jr nz` fails if min > byte; for max check, `jr c` fails if max < byte.
 - `ClampArpPosition` must be called after `ComputeNoteCount` in `LoadSlot`. Every other path that can shrink the note count (bank change, octave-range decrease, stride increase) already does this; missing it leaves `wArpPosition >= wNoteCount`, and the ascending-mode wrap-on-exact-equality never fires until 8-bit overflow.
 
-### MBC1 RAM-size code — use $02 (8 KB), not $01
+### MBC1 32 KB banked SRAM on EMS 64M carts — works, but probe every unit (V38)
+- V38 moved DMGARP to `$0149=$03` (32 KB / four 8 KB banks). MBC1 RAM banking needs
+  **mode 1** (`1→$6000`, set together with SRAM enable) and bank select via `$4000`.
+  With a 2-bank ROM the mode-1/BANK2 bits have no ROM-side effect (masked away), so
+  the switch is free.
+- On-device result: a healthy EMS USB 64M unit passes fully — distinct data in all
+  four banks, battery retention across power cycles. But **an individual unit was
+  found whose SRAM goes completely dead under the $03 size code** (every bank reads
+  open-bus, nothing retained) while the same cart works fine with `-r 2`. This is a
+  per-unit defect, not a family property — never generalize one cart's failure.
+- Probe before trusting battery saves: `make build-sramtest` builds
+  `src/sramtest.asm`, which writes per-bank signatures and shows `KEPT` (retention
+  from the previous run) and `LIVE` (this-session write/readback) as per-bank
+  PASS/FAIL. `F F F P` = banking ignored (all writes alias one bank); all-`F` = SRAM
+  dead under this header. mGBA passes regardless — the emulator proves the code
+  path, never the cart.
+
+### Slot-record growth must be guarded by a build-time assert (V37→V38 bug)
+- V37 appended a 61st entry to `SaveParamTable` but left the 64-byte slot stride
+  unchanged; the record (4 header + 61 params = 65 bytes) silently overlapped the
+  next slot, so **every save overwrote the neighbour's occupied flag** — occupied
+  slots appeared empty (data loss) or empty ones occupied (garbage).
+- The stride comment ("4 header + 55 params + 5 pad") had been stale for two
+  versions; nothing forced the arithmetic to be re-checked. V38 fixed the stride
+  (72) and added `ASSERT 4 + SAVE_PARAM_COUNT <= SAVE_SLOT_SIZE`. Any constant that
+  encodes "A must fit in B" belongs in a build-time ASSERT, not a comment.
+
+### MBC1 RAM-size code — use $02 (8 KB) or $03 (32 KB), never $01
 - Pan Docs lists `$0149=$01` as "unused/unofficial". The EMS USB 64M smart card treats it as "no SRAM": `EnableSRAM` is silently ignored and all reads from `$A000-$BFFF` return open-bus. The open-bus value on DMG is the opcode of the current read instruction; `LD A,[HLI]` = `$2A` = 42 decimal, which can produce visually plausible but entirely wrong data in any SRAM-backed table.
-- Use `rgbfix -r 2` (`$0149=$02`, 8 KB / 1 bank) as the smallest spec-compliant MBC1+RAM size. All standard MBC1 carts and flash carts handle this correctly. The actual SRAM usage need not fill the 8 KB; only the declared size matters for MBC1 enablement.
+- The spec-compliant MBC1+RAM sizes are `$02` (8 KB / 1 bank) and `$03` (32 KB / 4 banks). All standard MBC1 carts handle `$02`; see the V38 note above for `$03` on flash carts. The actual SRAM usage need not fill the declared size; only the declared size matters for MBC1 enablement.
 - Symptom on real hardware with wrong RAM size: every SRAM read returns the same opcode byte, producing identical junk values in every slot. In mGBA, save/load works fine because the emulator allocates SRAM regardless of the declared size code.
 - **Verification pattern**: after writing to SRAM, immediately read back a sentinel byte (e.g. the `occupied=1` commit byte) and compare. On a disabled or failed SRAM, the read-back will differ. This costs ~12 bytes but catches the failure before the "SAVED" tooltip misleads the user.
 
@@ -299,6 +326,6 @@ a real instrument.
 - Data references (`ld hl, Label`) work correctly with ROMX labels because `hl` is a full 16-bit register and the CPU maps the entire `$0000-$7FFF` space unconditionally.
 
 ### Sub-page input intercept pattern
-- DMGARP's save/load UI uses a `wSubPage` byte (0=none, 1=SAVE list, 2=LOAD list) that intercepts all joypad input at the top of `HandleInput` before SELECT / page routing. This is cleaner than per-page branches inside the existing page dispatchers: the sub-page owns the full button surface and can ignore SELECT, START, and modifier combos without coupling to each page's input logic.
+- DMGARP's save/load UI uses a `wSubPage` byte (0=none, 1=SAVE list, 2=LOAD list, 3=PRESET matrix) that intercepts all joypad input at the top of `HandleInput` before SELECT / page routing. This is cleaner than per-page branches inside the existing page dispatchers: the sub-page owns the full button surface and can ignore SELECT, START, and modifier combos without coupling to each page's input logic.
 - Key invariant: `DoPageRedraw` for the host page (CONTROLS) clears `wSubPage = 0` and `wSubDirty = 0` on re-entry. This means pressing B (which sets `wPageRedraw = 1`) exits the sub-page via the normal redraw path rather than a special exit routine. No separate "exit sub-page" VRAM clear is needed.
 - The main loop skips `UpdateHUD` while `wSubPage != 0` (only `HelpRowTick` still runs), preventing the normal HUD writer from overwriting sub-page content.

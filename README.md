@@ -12,7 +12,7 @@ Aleksi Eeben, the author of GB Electric Drum, once answered my
 request for source code with "It's a good practice. Go program it
 yourself." With DMGARP I finally did it.
 
-**[Download latest ROM (V37.1)](https://github.com/kennhartwig/dmgarp/releases/latest/download/dmg-arp.gb)**
+**[Download latest ROM (V38.2)](https://github.com/kennhartwig/dmgarp/releases/latest/download/dmg-arp.gb)**
 
 ---
 
@@ -82,11 +82,15 @@ Bjorklund pattern generator running on CH1:
 - 10 pages, navigated with SELECT
 - Help-row overlay: abbreviated values spell out in full for a short
   period after each change, then clear
-- 8-slot battery save (MBC1+RAM+BATTERY); slots identified by random
-  word names; two-press overwrite confirmation; successfully tested
-  with GB USB Smart Card 64M
+- 8-slot battery save (MBC1+RAM+BATTERY, 32 KB banked SRAM); slots
+  identified by random word names; two-press overwrite confirmation;
+  successfully tested with GB USB Smart Card 64M
+- 4×4 preset matrix (V38): 16 full-parameter snapshots per save slot for
+  instant switching mid-performance — save with overwrite confirm, load
+  with a single press, a dot marks the preset currently playing. Each
+  save slot stores its own matrix, so one slot ≈ one live set
 - WILD randomize (all parameters) and MILD randomize (keeps scale, root,
-  octave, and tempo), with 8-level undo/redo history
+  octave, and tempo) — the preset matrix is the recovery path
 - MIXER page: per-channel mute toggles (CH1/CH2/CH3/CH4, Euclidean kick)
 
 ---
@@ -104,6 +108,13 @@ Bjorklund pattern generator running on CH1:
 SELECT navigates between pages. START + SELECT navigate pages in
 reverse order. On the start screen, A+LEFT triggers a sound; START
 enters the instrument.
+
+On the CONTROLS page (10/10): A+↑ opens the SAVE list, B+↓ the LOAD
+list, A+→ the 4×4 preset matrix, START+↑/↓ triggers WILD/MILD
+randomize. Inside the preset matrix: D-pad moves the cursor in two
+dimensions, A saves into the cell (press twice to overwrite), B loads
+instantly, START deletes (press twice), SELECT returns. Occupied cells
+show inverted; a dot marks the preset currently playing.
 
 ---
 
@@ -127,7 +138,10 @@ Linux distributions, install mGBA separately from
 installation. `make build` only requires RGBDS and works on any Linux.
 
 Build pipeline: `rgbasm` → `rgblink` →
-`rgbfix -m 0x03 -r 2 -t DMGARP` (MBC1+RAM+BATTERY, 8 KB SRAM).
+`rgbfix -m 0x03 -r 3 -t DMGARP` (MBC1+RAM+BATTERY, 32 KB banked SRAM).
+Some EMS 64M flash-cart units fail to enable SRAM under the 32 KB header —
+probe yours with `make build-sramtest` before trusting battery saves
+(see `docs/HARDWARE-NOTES.md`).
 
 Additional targets:
 

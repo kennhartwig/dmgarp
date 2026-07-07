@@ -4,7 +4,7 @@ Starting map for the codebase, audio engine, and key symbols. Line numbers
 drift as the code evolves — treat them as approximate pointers and verify with
 `grep` before relying on a specific location.
 
-**Current version:** V0.37.1  
+**Current version:** V0.38.2  
 **Target hardware:** Original DMG Game Boy (1989). No CGB-specific features.  
 **Toolchain:** RGBDS v1.0.1
 
@@ -15,8 +15,9 @@ drift as the code evolves — treat them as approximate pointers and verify with
 ```
 dmgarp/
 ├── src/
-│   ├── arpeggio.asm          main source (~11 800 lines)
-│   └── euclid-table.inc      Euclidean pattern lookup (510 bytes, generated)
+│   ├── arpeggio.asm          main source (~12 000 lines)
+│   ├── euclid-table.inc      Euclidean pattern lookup (510 bytes, generated)
+│   └── sramtest.asm          SRAM banking probe ROM (make build-sramtest)
 ├── tools/
 │   └── gen-euclid-table.py   Euclidean table generator
 ├── scripts/
@@ -35,10 +36,11 @@ dmgarp/
 
 `rgbasm -o build/arpeggio.o src/arpeggio.asm`  
 `rgblink -o roms/dmg-arp.gb build/arpeggio.o`  
-`rgbfix -v -p 0xFF -m 0x03 -r 2 -t DMGARP roms/dmg-arp.gb`
+`rgbfix -v -p 0xFF -m 0x03 -r 3 -t DMGARP roms/dmg-arp.gb`
 
-Cart type: MBC1+RAM+BATTERY (`-m 0x03`), 8 KB SRAM (`-r 2`). The ROM is
-32 KB; SRAM holds 8 save slots.
+Cart type: MBC1+RAM+BATTERY (`-m 0x03`), 32 KB banked SRAM (`-r 3`, four
+8 KB banks via MBC1 mode-1 RAM banking). The ROM is 32 KB; SRAM bank 0
+holds the 8 save-slot records, bank 1 the eight per-slot preset matrices.
 
 ---
 
@@ -88,9 +90,13 @@ wStride             1–4
 wGateLength         0=OFF, 1=75%, 2=50%, 3=25%, 4=SIL (CH2 only)
 wRngState           LFSR for random pattern + general RNG
 wCurrentPage        0–9 (active UI page)
-wSubPage            0=none, 1=SAVE list, 2=LOAD list
-wSubCursor          0–7 (selected slot)
-wSubArmCounter      overwrite-confirm countdown (0=unarmed)
+wSubPage            0=none, 1=SAVE list, 2=LOAD list, 3=PRESET matrix
+wSubCursor          selected slot 0–7 (lists) / cell 0–15 (matrix)
+wSubArmCounter      two-press-confirm countdown (0=unarmed)
+wSubArmAction       which confirm is armed: 0=none, 1=overwrite, 2=delete
+wPresetBuf          16 × 61-byte preset snapshots (working matrix)
+wPresetOcc          16 occupied flags
+wPresetActive       last loaded/saved cell 0–15 ($FF=none, the "playing" dot)
 wMuteCH4            session mute flag for CH4 subsystems
 wMuteEuc            session mute flag for Euclidean kick (CH1 sweep)
 ```
@@ -181,7 +187,7 @@ page engages LOCK; plain ↓ releases it.
 | `EuclidKickSoundPresets` | 4 × 4-byte CH1 sweep records (TIGHT/BOOM/SUB/PUNCH) |
 | `EuclidKickNR10ByDecay` | 12 bytes (4 SOUNDs × 3 DECAYs) |
 | `SaveWordTable` | 64 × 7-byte random word names for save slots |
-| `SaveParamTable` | 46 WRAM addresses + terminator |
+| `SaveParamTable` | 61 WRAM addresses + terminator (`SAVE_PARAM_COUNT`) |
 | `HelpStr_*` | Help-row tooltip strings (1280 B, 20-tile fields) |
 
 ---
@@ -230,34 +236,56 @@ help-row overlay (20 tiles, auto-clears after ~3 s).
 
 `wSubPage = 1` (SAVE) or `2` (LOAD) → 8-slot list. UP/DOWN moves cursor;
 A acts (save requires two-press confirm via `wSubArmCounter`); B exits.
+Static button-hint rows sit on row 13 of each list.
 
-### Undo/redo history
+### Preset matrix (V38)
 
-Two 8-level ring-buffer stacks in WRAM (`wRndUndoBuf` / `wRndRedoBuf`,
-368 bytes each). 46-byte snapshots. Session-only (lost on power-off). Manual
-parameter edits do not snapshot.
+`wSubPage = 3` → 4×4 grid of 16 full-parameter snapshots (entered with A+→
+on CONTROLS). Snapshots reuse the save system's `CaptureCurrentState` /
+`RestoreState` walk over `SaveParamTable` (61 bytes each) into `wPresetBuf`.
+D-pad moves the cursor in 2D (cursor bits 3-2 = row, 1-0 = column); A saves
+into the cell (two-press confirm on overwrite, `wSubArmAction=1`), B loads
+with a single press (`ApplyParamReconciliation` runs, the CONTROLS repaint
+is suppressed so the performer stays on the grid), START deletes
+(two-press, `wSubArmAction=2`), SELECT exits. Occupied cells render as
+inverted digits; `wPresetActive` draws a dot after the cell that is
+currently playing. The working matrix lives in WRAM and reaches SRAM only
+through a slot save — an unsaved matrix is lost at power-off by design.
 
 ---
 
 ## Battery SRAM Layout
 
+Schema 8 (V38). 32 KB SRAM, four 8 KB banks; MBC1 mode 1 is set alongside
+SRAM enable, bank select via `$4000`. Bank 0 is the resting state.
+
 ```
-$A000  4 B   Magic 'D','A','R','P'
-$A004  1 B   Schema version
-$A005  3 B   Reserved
-$A008  52 B  Slot 0  (occupied, word_idx, param1, param2, params[46], pad[2])
-$A03C  52 B  Slot 1
-...
-$A152  52 B  Slot 7
+BANK 0                                   BANK 1
+$A000  4 B   Magic 'D','A','R','P'      $A000  1024 B  Slot 0 preset matrix
+$A004  1 B   Schema version ($08)       $A400  1024 B  Slot 1 preset matrix
+$A005  3 B   Reserved                   ...            stride 1024 — eight
+$A008  72 B  Slot 0                                    matrices fill the bank
+...          stride 72, 8 slots         BANKS 2-3      unused
 ```
 
+Slot record (72 B): occupied, word_idx, name fields ×2, params[61],
+active-preset byte (offset 65, $FF=none — restores the "playing" dot on
+load), pad. Preset record (64 B): occupied, params[61], pad[2]. Slot saves
+are transactional (occupied=0 → params → matrix → occupied=1 commit) so a
+power loss mid-save leaves the slot empty, never corrupt. Loads
+range-validate every param byte (slots and each occupied preset) against
+`SaveParamRangeTable` before touching WRAM.
+
 `EnsureSRAM` validates magic + schema on boot; wipes occupied flags
-(not param bytes) on mismatch. SRAM must be explicitly enabled/disabled around
-every access via the MBC1 enable register.
+(slot and preset, not param bytes) on mismatch. SRAM must be explicitly
+enabled/disabled around every access via the MBC1 enable register.
 
 **Schema version must be incremented whenever `SaveParamTable` changes** (any
 address, range bound, or entry count change). Without the bump, old SRAM is
-silently read into the new layout.
+silently read into the new layout. A build-time
+`ASSERT 4 + SAVE_PARAM_COUNT <= SAVE_SLOT_SIZE` guards the slot stride —
+V37 shipped a 65-byte record in a 64-byte stride, and every save overwrote
+the next slot's occupied flag.
 
 ---
 

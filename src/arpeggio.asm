@@ -135,8 +135,8 @@ DEF INV_TILE_X        EQU INV_TILE_BASE + TILE_X
 DEF ARP_BANK_COUNT   EQU 28
 DEF SCALE_ENTRY_SIZE EQU 10
 DEF VERSION_RELEASE  EQU 0
-DEF VERSION_FEATURE  EQU 37
-DEF VERSION_FIX      EQU 1
+DEF VERSION_FEATURE  EQU 38
+DEF VERSION_FIX      EQU 2
 DEF DEFAULT_SPEED    EQU 11
 DEF MIN_SPEED        EQU 0
 DEF MAX_SPEED        EQU 31
@@ -204,14 +204,32 @@ DEF MAX_PAGE         EQU 9   ; pages 0..9 (MAIN, CH1, TIMING, WAVE, ACCENT, FILL
 ; --- V30 Save/Load constants ---
 DEF SAVE_WORD_COUNT    EQU 64   ; entries in SaveWordTable
 DEF SAVE_SLOT_COUNT    EQU 8    ; save slots
-DEF SAVE_SLOT_SIZE     EQU 64   ; bytes per slot: 4 header + 55 params + 5 pad (V35: fixed off-by-one from V34)
+DEF SAVE_SLOT_SIZE     EQU 72   ; bytes per slot: 4 header + 61 params + 7 pad (V38: was 64 — see slot-overlap bug, GB-DEV-LESSONS)
 DEF SRAM_MAGIC_0       EQU $44  ; 'D'
 DEF SRAM_MAGIC_1       EQU $41  ; 'A'
 DEF SRAM_MAGIC_2       EQU $52  ; 'R'
 DEF SRAM_MAGIC_3       EQU $50  ; 'P'
-DEF SAVE_SCHEMA_VERSION EQU 7   ; bumped V37: wEuclidKickLock added to save table
+DEF SAVE_SCHEMA_VERSION EQU 8   ; bumped V38: slot stride 72, per-slot preset matrix appended
 DEF SAVE_PARAM_COUNT   EQU 61   ; entries in SaveParamTable (+1 lock param V37)
 DEF SUB_ARM_FRAMES     EQU 120  ; 2 seconds at 60 Hz
+; --- V38 preset matrix constants ---
+; SRAM is 32 KB / 4 banks (header -r 3). Slot records live in bank 0, the eight
+; per-slot preset matrices fill SRAM BANK 1 exactly (8 × 1024 = 8 KB). MBC1 RAM
+; banking: mode 1 via $6000 (set in EnableSRAM), bank select via $4000-$5FFF.
+; On-device verified 2026-07-07 (cart 4). Cart 3's SRAM only responds to an 8 KB
+; header — cart-specific defect; cart 3 is retired from SRAM duty (see
+; GB-DEV-LESSONS "EMS 64M: probe every cart").
+DEF PRESET_COUNT       EQU 16   ; 4×4 matrix cells
+DEF PRESET_SIZE        EQU 64   ; SRAM bytes per preset: 1 occupied + 61 params + 2 pad
+DEF MATRIX_SIZE        EQU PRESET_COUNT * PRESET_SIZE ; 1024 bytes per slot matrix
+DEF MATRIX_BASE        EQU $A000 ; in SRAM BANK 1: MATRIX_BASE + slot*1024
+DEF MATRIX_SRAM_BANK   EQU 1    ; matrices' RAM bank; all other save data = bank 0
+; A slot record must never bleed into its neighbour (V37 shipped exactly that bug:
+; 4+61 = 65 > 64 — saving slot N clobbered slot N+1's occupied flag).
+ASSERT 4 + SAVE_PARAM_COUNT <= SAVE_SLOT_SIZE
+; Slot records fit bank 0; matrices fit bank 1.
+ASSERT $A008 + SAVE_SLOT_COUNT * SAVE_SLOT_SIZE <= $C000
+ASSERT MATRIX_BASE + SAVE_SLOT_COUNT * MATRIX_SIZE <= $C000
 
 ; =============================================================================
 ; Interrupt Vectors
@@ -434,16 +452,18 @@ wMuteEuc:            ds 1   ; 0=audible, 1=Euclid kick (CH1 sweep) muted
 wMuteCH1:            ds 1   ; 0=audible, 1=CH1 melodic companion muted (V36)
 wMuteCH2:            ds 1   ; 0=audible, 1=CH2 arp note muted (V36)
 wMuteCH3:            ds 1   ; 0=audible, 1=CH3 wave muted (V36)
-; --- V31.3 Randomize undo/redo history (two ring-buffer stacks, session-only) ---
-; Snapshots are SAVE_PARAM_COUNT-byte copies of all SaveParamTable entries.
-; Push on: randomize (WILD/MILD) and successful slot-LOAD. Manual edits: no snapshot.
-; ST+← = Undo; ST+→ = Redo; both on CONTROLS page (page 9) only.
-wRndUndoBuf:         ds 8 * SAVE_PARAM_COUNT   ; 368 bytes — undo ring buffer
-wRndUndoCount:       ds 1                       ; 0..8 valid entries
-wRndUndoHead:        ds 1                       ; 0..7 next-push index (top = head-1)
-wRndRedoBuf:         ds 8 * SAVE_PARAM_COUNT   ; 368 bytes — redo ring buffer
-wRndRedoCount:       ds 1
-wRndRedoHead:        ds 1
+; --- V38 preset matrix (16 presets, WRAM working copy; persisted per save slot) ---
+; Each preset is a SAVE_PARAM_COUNT-byte copy of all SaveParamTable entries
+; (same snapshot format the old undo/redo history used). The matrix lives in
+; WRAM only while playing; it reaches SRAM exclusively through SaveSlot and is
+; restored by LoadSlot — build a matrix, save the slot, or lose it at power-off.
+; 4×4 UI on the CONTROLS sub-page (wSubPage=3): A=load, B=save, ST=del, SEL=back.
+wPresetBuf:          ds PRESET_COUNT * SAVE_PARAM_COUNT ; 16 × 61 = 976 bytes
+wPresetOcc:          ds PRESET_COUNT            ; per-preset occupied flag (0=empty)
+wSubArmAction:       ds 1                       ; armed confirm: 0=none, 1=overwrite, 2=delete
+wPresetActive:       ds 1                       ; V38.1: last loaded/saved cell 0..15 ($FF=none);
+                                                ; session marker only (not saved); shown as a
+                                                ; dot after the cell digits. Reset on LoadSlot.
 
 ; =============================================================================
 ; Main Code
@@ -612,13 +632,18 @@ EntryPoint:
     ld [wSubDirty], a
     ld [wSubDrawSlot], a
     ld [wSubSavedWord], a
+    ld [wSubArmAction], a
 
-    ; --- V31.3 history state ---
-    xor a
-    ld [wRndUndoCount], a
-    ld [wRndUndoHead], a
-    ld [wRndRedoCount], a
-    ld [wRndRedoHead], a
+    ; --- V38 preset matrix: boot empty; LoadSlot brings in a slot's matrix ---
+    ld hl, wPresetOcc
+    ld b, PRESET_COUNT
+.clearPresetOcc:
+    ld [hl], 0
+    inc hl
+    dec b
+    jr nz, .clearPresetOcc
+    ld a, $FF
+    ld [wPresetActive], a       ; no active preset yet
     ; --- V32/V36 mute flags ---
     xor a
     ld [wMuteCH4], a
@@ -1736,18 +1761,31 @@ HandleInput:
     ret
 
 .page9Input:
-    ; Page 9 (CONTROLS): A+UP → SAVE sub-page; B+DOWN → LOAD sub-page
+    ; Page 9 (CONTROLS): A+UP → SAVE sub-page; A+RIGHT → PRESET matrix;
+    ; B+DOWN → LOAD sub-page
     bit 4, b                    ; A held?
     jr z, .p9NoA
     bit 5, b                    ; AB held? → no-op
     jr nz, .p9NoA
     bit 2, c                    ; UP newly pressed?
-    jr z, .p9NoA
+    jr z, .p9NoAUp
     ld a, 1
     ld [wSubPage], a            ; enter SAVE list
     xor a
     ld [wSubCursor], a
     ld [wSubArmCounter], a
+    ld a, 1
+    ld [wSubDirty], a
+    ret
+.p9NoAUp:
+    bit 0, c                    ; RIGHT newly pressed? (V38)
+    jr z, .p9NoA
+    ld a, 3
+    ld [wSubPage], a            ; enter PRESET matrix
+    xor a
+    ld [wSubCursor], a
+    ld [wSubArmCounter], a
+    ld [wSubArmAction], a
     ld a, 1
     ld [wSubDirty], a
     ret
@@ -1779,16 +1817,8 @@ HandleInput:
     jp RandomizeWild
 .p9NoStUp:
     bit 3, c                    ; DOWN newly pressed? → MILD randomize
-    jr z, .p9NoStDn
-    jp RandomizeMild
-.p9NoStDn:
-    bit 1, c                    ; LEFT newly pressed? → Undo
-    jr z, .p9NoStLf
-    jp RndHistoryUndo
-.p9NoStLf:
-    bit 0, c                    ; RIGHT newly pressed? → Redo
     ret z
-    jp RndHistoryRedo
+    jp RandomizeMild
 
 .pageDone:
     ret
@@ -2703,7 +2733,7 @@ DoPageRedraw:
     call BlankPageRows          ; clears rows 0-5 and 8-14 (rows 6/7 skipped)
     ld hl, $98C0                ; row 6 — blank explicitly
     call BlankRow
-    ld hl, $98E0                ; row 7 — blank explicitly (UNDO row, may stay blank)
+    ld hl, $98E0                ; row 7 — blank explicitly (PRESET row drawn below)
     call BlankRow
     ; Reset sub-page state on CONTROLS page entry
     xor a
@@ -2711,20 +2741,6 @@ DoPageRedraw:
     ld [wSubDirty], a
     ld hl, ControlsPage9_Base
     call DrawData
-    ; UNDO row: only draw when undo history is available
-    ld a, [wRndUndoCount]
-    and a
-    jr z, .skipUndoRow
-    ld hl, ControlsPage9_UndoRow
-    call DrawData
-.skipUndoRow:
-    ; REDO row: only draw when redo history is available
-    ld a, [wRndRedoCount]
-    and a
-    jr z, .skipRedoRow
-    ld hl, ControlsPage9_RedoRow
-    call DrawData
-.skipRedoRow:
 .reenable:
     ; Help row: clear row 17 explicitly here so the user never sees a stale
     ; long-name overlay on the new page, even for the one frame between this
@@ -7123,7 +7139,8 @@ UpdateHUD:
     jp .doneIndicators
 
 .controlsPageInd:
-    ; Page 9 (CONTROLS): A alone → ▶ on SAVE row (row 3); B alone → ▶ on LOAD row (row 4)
+    ; Page 9 (CONTROLS): A alone → ▶ on SAVE row (row 3) + PRESET row (row 7);
+    ; B alone → ▶ on LOAD row (row 4)
     ld a, b
     and %00110000
     cp %00010000            ; A alone (bit4 set, bit5 clear)
@@ -7134,6 +7151,7 @@ UpdateHUD:
     ld a, TILE_BLANK
 .ctrlWriteA:
     ld [$9860], a           ; row 3 col 0 (SAVE row)
+    ld [$98E0], a           ; row 7 col 0 (PRESET row)
     ld a, b
     and %00110000
     cp %00100000            ; B alone (bit5 set, bit4 clear)
@@ -7144,7 +7162,7 @@ UpdateHUD:
     ld a, TILE_BLANK
 .ctrlWriteB:
     ld [$9880], a           ; row 4 col 0 (LOAD row)
-    ; ST alone → ▶ on RND ALL (row 5), RND FX (row 6), UNDO (row 7), REDO (row 8)
+    ; ST alone → ▶ on RND ALL (row 5), RND FX (row 6)
     ld a, b
     and %10110000           ; mask A(4) + B(5) + ST(7)
     cp %10000000            ; ST alone?
@@ -7154,29 +7172,8 @@ UpdateHUD:
 .ctrlNoST:
     ld a, TILE_BLANK
 .ctrlWriteST:
-    ld c, a                 ; c = TILE_PLAY or TILE_BLANK (for conditional rows)
-    ld [$98A0], a           ; row 5 col 0 (RND ALL row)  — unconditional
-    ld [$98C0], a           ; row 6 col 0 (RND FX row)   — unconditional
-    ; UNDO row (row 7): ▶ only when undo stack is non-empty
-    ld a, [wRndUndoCount]
-    and a
-    jr nz, .ctrlUndoShow
-    ld a, TILE_BLANK
-    jr .ctrlUndoWrite
-.ctrlUndoShow:
-    ld a, c
-.ctrlUndoWrite:
-    ld [$98E0], a           ; row 7 col 0 (UNDO row)
-    ; REDO row (row 8): ▶ only when redo stack is non-empty
-    ld a, [wRndRedoCount]
-    and a
-    jr nz, .ctrlRedoShow
-    ld a, TILE_BLANK
-    jr .ctrlRedoWrite
-.ctrlRedoShow:
-    ld a, c
-.ctrlRedoWrite:
-    ld [$9900], a           ; row 8 col 0 (REDO row)
+    ld [$98A0], a           ; row 5 col 0 (RND ALL row)
+    ld [$98C0], a           ; row 6 col 0 (RND FX row)
     jp .doneIndicators
 
 .fillPageInd:
@@ -8216,6 +8213,8 @@ BlankPageRows:
     call BlankRow
     ld hl, $99C0    ; row 14 (TONAL LOCK row)
     call BlankRow
+    ld hl, $99E0    ; row 15 (V38.1: matrix/list hint rows must not bleed into pages)
+    call BlankRow
     pop bc
     ret
 
@@ -8226,6 +8225,10 @@ BlankPageRows:
 EnableSRAM:
     ld a, $0A
     ld [$0000], a
+    ld a, 1
+    ld [$6000], a               ; MBC1 mode 1 — enables RAM banking (V38 32 KB SRAM).
+                                ; Harmless on the EMS mapper (probe-verified on-device);
+                                ; no ROM-side effect for a 2-bank ROM (BANK2 bits masked).
     ret
 
 DisableSRAM:
@@ -8236,6 +8239,8 @@ DisableSRAM:
 ; EnsureSRAM — validate magic+version at $A000; wipe and re-init if wrong.
 EnsureSRAM:
     call EnableSRAM
+    xor a
+    ld [$4000], a               ; defensive: header/slot data lives in RAM bank 0
     ld hl, $A000
     ld a, [hli]
     cp SRAM_MAGIC_0
@@ -8277,6 +8282,26 @@ EnsureSRAM:
     add hl, de
     dec c
     jr nz, .clearSlot
+    ; V38: zero every preset occupied flag in every slot's matrix (SRAM bank 1)
+    ld a, MATRIX_SRAM_BANK
+    ld [$4000], a
+    ld c, 0
+.clearMatrix:
+    ld a, c
+    call GetMatrixBase          ; hl = matrix base for slot c
+    ld de, PRESET_SIZE
+    ld b, PRESET_COUNT
+.clearPreset:
+    ld [hl], 0
+    add hl, de
+    dec b
+    jr nz, .clearPreset
+    inc c
+    ld a, c
+    cp SAVE_SLOT_COUNT
+    jr nz, .clearMatrix
+    xor a
+    ld [$4000], a               ; back to bank 0
 .sramOk:
     call DisableSRAM
     ret
@@ -8311,6 +8336,115 @@ GetSlotOccupied:
     pop hl
     pop de
     pop bc
+    ret
+
+; --- V38 per-slot preset-matrix SRAM helpers ---------------------------------
+; The matrices live in SRAM BANK 1 ($4000-select). Both copy routines switch to
+; bank 1 on entry and back to bank 0 before returning, so all other SRAM code
+; can keep assuming bank 0.
+
+; GetMatrixBase(a = slot) → hl = MATRIX_BASE + slot*MATRIX_SIZE. Clobbers a.
+; Relies on MATRIX_SIZE being a whole number of 256-byte pages.
+ASSERT MATRIX_SIZE == 1024
+GetMatrixBase:
+    add a
+    add a                       ; a = slot*4 (pages of 256)
+    add HIGH(MATRIX_BASE)
+    ld h, a
+    ld l, LOW(MATRIX_BASE)
+    ret
+
+; WriteMatrixToSRAM(a = slot) — copy the WRAM preset matrix into the slot's
+; SRAM matrix area (16 records: occupied + 61 params + 2 pad).
+; SRAM must be enabled by the caller. Clobbers a, b, c, d, e, hl.
+WriteMatrixToSRAM:
+    call GetMatrixBase          ; hl = SRAM dest
+    ld a, MATRIX_SRAM_BANK
+    ld [$4000], a               ; matrices live in SRAM bank 1
+    ld de, wPresetBuf           ; de = WRAM param source (packed, 61-byte stride)
+    ld c, 0                     ; c = preset index
+.wmPreset:
+    push hl
+    ld b, 0
+    ld hl, wPresetOcc
+    add hl, bc                  ; bc = index (b=0)
+    ld a, [hl]
+    pop hl
+    ld [hli], a                 ; record byte 0: occupied
+    ld b, SAVE_PARAM_COUNT
+.wmParams:
+    ld a, [de]
+    inc de
+    ld [hli], a
+    dec b
+    jr nz, .wmParams
+    inc hl                      ; skip 2 pad bytes → next 64-byte record
+    inc hl
+    inc c
+    ld a, c
+    cp PRESET_COUNT
+    jr nz, .wmPreset
+    xor a
+    ld [$4000], a               ; back to bank 0
+    ret
+
+; ReadMatrixFromSRAM(a = slot) — copy the slot's SRAM matrix into WRAM.
+; Every occupied record is range-validated first (same walk as ValidateSlot);
+; empty or out-of-range records leave wPresetOcc[i]=0 and the WRAM params alone.
+; SRAM must be enabled by the caller. Clobbers a, b, c, d, e, hl.
+ReadMatrixFromSRAM:
+    call GetMatrixBase          ; hl = SRAM record base
+    ld a, MATRIX_SRAM_BANK
+    ld [$4000], a               ; matrices live in SRAM bank 1
+    ld c, 0                     ; c = preset index
+.rmPreset:
+    ld a, [hl]                  ; occupied byte
+    and a
+    jr z, .rmEmpty
+    push hl
+    push bc
+    inc hl                      ; first param byte
+    call ValidateParamsAt       ; a=1 if all 61 bytes in range
+    pop bc
+    pop hl
+    and a
+    jr z, .rmEmpty
+    ; copy 61 params into wPresetBuf + index*61
+    push hl                     ; record base
+    ld a, c
+    push bc
+    call GetPresetPtr           ; hl = WRAM dest
+    pop bc
+    pop de                      ; de = SRAM record base
+    push de                     ; keep for the stride advance below
+    inc de                      ; params start at record byte 1
+    ld b, SAVE_PARAM_COUNT
+.rmCopy:
+    ld a, [de]
+    inc de
+    ld [hli], a
+    dec b
+    jr nz, .rmCopy
+    pop hl                      ; hl = record base
+    ld a, 1
+    jr .rmSetOcc
+.rmEmpty:
+    xor a
+.rmSetOcc:
+    push hl
+    ld b, 0
+    ld hl, wPresetOcc
+    add hl, bc
+    ld [hl], a
+    pop hl
+    ld de, PRESET_SIZE
+    add hl, de                  ; next record
+    inc c
+    ld a, c
+    cp PRESET_COUNT
+    jr nz, .rmPreset
+    xor a
+    ld [$4000], a               ; back to bank 0
     ret
 
 ; PickRandomWord — returns a = word index 0..SAVE_WORD_COUNT-1
@@ -8348,8 +8482,9 @@ NextRandomByte:
     ret
 
 ; RandomizeWild — randomize all saved params except wTapEffective (tap cache).
+; V38: no pre-mutation snapshot — undo/redo removed; save a preset first if the
+; current state is worth keeping.
 RandomizeWild:
-    call RndHistoryPushPreMutation
     xor a
     call RandomizeParams
     jp HelpFor_RndWild
@@ -8357,7 +8492,6 @@ RandomizeWild:
 ; RandomizeMild — randomize all saved params except wTapEffective and key/tempo
 ; anchors (wCurrentBank, wRootNote, wRootOctave, wSpeed). Musical context stays.
 RandomizeMild:
-    call RndHistoryPushPreMutation
     ld a, 1
     call RandomizeParams
     jp HelpFor_RndMild
@@ -8468,7 +8602,7 @@ RandomizeParams:
 
 ; ApplyParamReconciliation — shared post-mutation tail: push CH3 wave to Wave RAM,
 ; clamp Euclid K/Rot, refresh note-count/arp-position caches, set all repaint flags.
-; Called after: RandomizeParams, LoadSlot, RndHistoryUndo/Redo.
+; Called after: RandomizeParams, LoadSlot, MatrixLoadPreset.
 ; Clobbers a. Other registers depend on callees.
 ApplyParamReconciliation:
     call LoadWaveRAM
@@ -8490,7 +8624,7 @@ ApplyParamReconciliation:
     ld [wTapFrac], a
     ld [wTapCounter], a
     ld [wTapCount], a
-    ; Sync pending CH1 mode + sub-params to committed values (load/randomize/undo).
+    ; Sync pending CH1 mode + sub-params to committed values (load/randomize/preset).
     ld a, [wCH1Mode]
     ld [wCH1ModePending], a
     ld a, [wCH1Detune]
@@ -8504,35 +8638,31 @@ ApplyParamReconciliation:
     ret
 
 ; =============================================================================
-; V31.3 Randomize Undo/Redo History
+; V38 Preset Matrix snapshots (replaces the V31.3 undo/redo history)
 ; =============================================================================
 
-; HistSlotOffsets — word table: slot * SAVE_PARAM_COUNT for slots 0..7.
-; Used by GetHistSlotPtr to avoid awkward 46-multiply in asm.
-HistSlotOffsets:
-    dw 0
-    dw SAVE_PARAM_COUNT * 1
-    dw SAVE_PARAM_COUNT * 2
-    dw SAVE_PARAM_COUNT * 3
-    dw SAVE_PARAM_COUNT * 4
-    dw SAVE_PARAM_COUNT * 5
-    dw SAVE_PARAM_COUNT * 6
-    dw SAVE_PARAM_COUNT * 7
+; PresetSlotOffsets — word table: preset * SAVE_PARAM_COUNT for presets 0..15.
+; Avoids an awkward 61-multiply in asm.
+PresetSlotOffsets:
+DEF PS_IDX = 0
+REPT PRESET_COUNT
+    dw SAVE_PARAM_COUNT * PS_IDX
+DEF PS_IDX = PS_IDX + 1
+ENDR
 
-; GetHistSlotPtr(a = slot 0..7, hl = ring-buffer base) → hl = base + slot*SAVE_PARAM_COUNT
+; GetPresetPtr(a = preset 0..15) → hl = wPresetBuf + preset*SAVE_PARAM_COUNT
 ; Clobbers a, d, e.
-GetHistSlotPtr:
-    add a               ; a = slot * 2 (word index)
+GetPresetPtr:
+    add a               ; a = preset * 2 (word index)
     ld e, a
     ld d, 0
-    push hl             ; save base
-    ld hl, HistSlotOffsets
-    add hl, de          ; hl = table + slot*2
+    ld hl, PresetSlotOffsets
+    add hl, de          ; hl = table + preset*2
     ld a, [hli]
     ld e, a
     ld a, [hl]
-    ld d, a             ; de = slot * SAVE_PARAM_COUNT
-    pop hl              ; restore base
+    ld d, a             ; de = preset * SAVE_PARAM_COUNT
+    ld hl, wPresetBuf
     add hl, de
     ret
 
@@ -8569,118 +8699,6 @@ RestoreState:
     ld a, [hli]         ; read from snapshot buffer
     ld [bc], a          ; write WRAM param
     jr .rsLoop
-
-; RndHistoryPushPreMutation — snapshot current WRAM to undo ring; clear redo.
-; Call BEFORE any randomize or slot-load mutation.
-; Clobbers a, b, c, d, e, hl.
-RndHistoryPushPreMutation:
-    ; Destination: wRndUndoBuf + undoHead * SAVE_PARAM_COUNT
-    ld a, [wRndUndoHead]
-    ld hl, wRndUndoBuf
-    call GetHistSlotPtr
-    call CaptureCurrentState
-    ; Advance head (mod 8), cap count at 8 (ring evicts oldest silently)
-    ld a, [wRndUndoHead]
-    inc a
-    and 7
-    ld [wRndUndoHead], a
-    ld a, [wRndUndoCount]
-    cp 8
-    jr z, .undoCapped
-    inc a
-    ld [wRndUndoCount], a
-.undoCapped:
-    ; Clear redo stack — new mutation branches the timeline
-    xor a
-    ld [wRndRedoCount], a
-    ld [wRndRedoHead], a
-    ret
-
-; RndHistoryUndo — restore WRAM from top of undo stack; push current to redo.
-; Called from page-9 ST+← input handler. Runs ApplyParamReconciliation + help flash.
-RndHistoryUndo:
-    ld a, [wRndUndoCount]
-    and a
-    jr nz, .doUndo
-    xor a
-    ld hl, HelpStr_NoUndo
-    jp ShowHelpByIndex
-.doUndo:
-    ; Push current WRAM to redo ring
-    ld a, [wRndRedoHead]
-    ld hl, wRndRedoBuf
-    call GetHistSlotPtr
-    call CaptureCurrentState
-    ld a, [wRndRedoHead]
-    inc a
-    and 7
-    ld [wRndRedoHead], a
-    ld a, [wRndRedoCount]
-    cp 8
-    jr z, .redoFull
-    inc a
-    ld [wRndRedoCount], a
-.redoFull:
-    ; Pop from undo: decrement count, retreat head
-    ld a, [wRndUndoCount]
-    dec a
-    ld [wRndUndoCount], a
-    ld a, [wRndUndoHead]
-    dec a
-    and 7
-    ld [wRndUndoHead], a        ; new head = top of undo entry to restore
-    ; Restore from undo[new head] into WRAM
-    ld hl, wRndUndoBuf
-    call GetHistSlotPtr         ; a still = new head
-    call RestoreState
-    call ApplyParamReconciliation
-    xor a
-    ld hl, HelpStr_Undo
-    jp ShowHelpByIndex
-
-; RndHistoryRedo — mirror of RndHistoryUndo against the redo stack.
-; Invariant: current WRAM (including any manual edits made after an undo) is pushed
-; to the undo ring before restoring the redo snapshot. Manual edits are not lost —
-; they are recoverable by pressing undo after a redo.
-RndHistoryRedo:
-    ld a, [wRndRedoCount]
-    and a
-    jr nz, .doRedo
-    xor a
-    ld hl, HelpStr_NoRedo
-    jp ShowHelpByIndex
-.doRedo:
-    ; Push current WRAM to undo ring
-    ld a, [wRndUndoHead]
-    ld hl, wRndUndoBuf
-    call GetHistSlotPtr
-    call CaptureCurrentState
-    ld a, [wRndUndoHead]
-    inc a
-    and 7
-    ld [wRndUndoHead], a
-    ld a, [wRndUndoCount]
-    cp 8
-    jr z, .undoFull
-    inc a
-    ld [wRndUndoCount], a
-.undoFull:
-    ; Pop from redo: decrement count, retreat head
-    ld a, [wRndRedoCount]
-    dec a
-    ld [wRndRedoCount], a
-    ld a, [wRndRedoHead]
-    dec a
-    and 7
-    ld [wRndRedoHead], a        ; new head = top of redo entry to restore
-    ; Restore from redo[new head] into WRAM
-    ld hl, wRndRedoBuf
-    call GetHistSlotPtr         ; a still = new head
-    call RestoreState
-    call ApplyParamReconciliation
-    xor a
-    ld hl, HelpStr_Redo
-    jp ShowHelpByIndex
 
 ; ComputeNameDigits — returns d=field1(0..99), e=field2(0..99)
 ; field1 = (wRootNote*5 + wSpeed) mod 100
@@ -8783,6 +8801,15 @@ SaveSlot:
     ld [hli], a
     jr .saveLoop
 .saveDone:
+    ; V38.2: slot offset 65 (first pad byte, hl points there after the params)
+    ; remembers which preset was playing when the slot was saved, so the dot
+    ; reappears right after a slot load. $FF = none.
+    ld a, [wPresetActive]
+    ld [hl], a
+    ; V38: persist the working preset matrix alongside the params. Runs before
+    ; the occupied=1 commit so a power loss mid-matrix leaves the slot empty.
+    ld a, [wSubDrawSlot]
+    call WriteMatrixToSRAM
     ; Commit: write occupied=1 only after full payload is written
     ld a, [wSubDrawSlot]
     call GetSlotPtr          ; hl = slot SRAM base
@@ -8812,7 +8839,7 @@ SaveSlot:
     pop bc
     ret
 
-; ValidateSlot(a = slot index 0..7) → a = 1 if all params in range, 0 if any out of range.
+; ValidateSlot(a = slot index) → a = 1 if all params in range, 0 if any out of range.
 ; Caller must EnableSRAM first. Read-only: no WRAM or SRAM writes.
 ValidateSlot:
     push bc
@@ -8823,31 +8850,38 @@ ValidateSlot:
     inc hl                   ; skip word_idx
     inc hl                   ; skip field1
     inc hl                   ; skip field2 → now at param byte 0
+    call ValidateParamsAt
+    pop hl
+    pop de
+    pop bc
+    ret
+
+; ValidateParamsAt — hl = first of SAVE_PARAM_COUNT stored param bytes.
+; Returns a = 1 if every byte is within its SaveParamRangeTable bounds, else 0.
+; Shared by ValidateSlot (slot records) and ReadMatrixFromSRAM (preset records).
+; Clobbers a, b, c, d, e, hl.
+ValidateParamsAt:
     ld de, SaveParamRangeTable
-    ld b, SAVE_PARAM_COUNT   ; b = 46 iterations
-.vsLoop:
+    ld b, SAVE_PARAM_COUNT
+.vpLoop:
     ld a, [hli]              ; a = stored byte, advance hl
     ld c, a                  ; c = byte under test
     ld a, [de]               ; a = min
     inc de
     cp c
-    jr c, .vsMaxCheck        ; min < byte: OK, check max
-    jr nz, .vsFail           ; min > byte: FAIL
-.vsMaxCheck:
+    jr c, .vpMaxCheck        ; min < byte: OK, check max
+    jr nz, .vpFail           ; min > byte: FAIL
+.vpMaxCheck:
     ld a, [de]               ; a = max
     inc de
     cp c
-    jr c, .vsFail            ; max < byte: FAIL
+    jr c, .vpFail            ; max < byte: FAIL
     dec b
-    jr nz, .vsLoop
+    jr nz, .vpLoop
     ld a, 1                  ; all params in range
-    jr .vsDone
-.vsFail:
+    ret
+.vpFail:
     xor a
-.vsDone:
-    pop hl
-    pop de
-    pop bc
     ret
 
 ; LoadSlot(a = slot index 0..7) → a = 1 on success, 0 if slot fails validation.
@@ -8857,13 +8891,12 @@ LoadSlot:
     push de
     push hl
     ld b, a
+    ld [wSubDrawSlot], a ; V38: stash slot for the matrix copy (b dies in the loop)
     call EnableSRAM
     ld a, b
     call ValidateSlot    ; a=1 if all params in range, 0 if any out of range
     and a
     jr z, .loadFail      ; invalid: bail without touching WRAM
-    ; Snapshot current state before mutating — allows ST+← undo after load
-    call RndHistoryPushPreMutation
     ld a, b
     call GetSlotPtr     ; hl = slot SRAM addr
     ; Skip 4-byte header (occupied, word_idx, field1, field2)
@@ -8886,6 +8919,27 @@ LoadSlot:
     ld [bc], a          ; write WRAM
     jr .loadLoop
 .loadDone:
+    ; V38.2: hl sits at slot offset 65 — the stored active-preset byte. Read it
+    ; before ReadMatrixFromSRAM clobbers hl/banks; sanitized below.
+    ld a, [hl]
+    ld [wPresetActive], a
+    ; V38: restore the slot's preset matrix into WRAM (validated per preset)
+    ld a, [wSubDrawSlot]
+    call ReadMatrixFromSRAM
+    ; Sanitize the restored marker: pre-V38.2 slots carry garbage in that pad
+    ; byte, and a valid index must point at an occupied cell of the matrix we
+    ; just loaded. Anything else → $FF (no dot).
+    ld a, [wPresetActive]
+    cp PRESET_COUNT
+    jr nc, .loadNoActive
+    call GetPresetOccPtr        ; hl = wPresetOcc + index (clobbers d, e)
+    ld a, [hl]
+    and a
+    jr nz, .loadActiveOk
+.loadNoActive:
+    ld a, $FF
+    ld [wPresetActive], a
+.loadActiveOk:
     call DisableSRAM
     call ApplyParamReconciliation
     pop hl
@@ -9075,35 +9129,28 @@ DrawOneSlotRow:
     ld [hli], a
     ret
 
-; DrawSubPage — clear screen and render sub-page (SAVE/LOAD slot list).
-; Called from main loop when wSubDirty != 0. LCD is re-enabled on exit.
+; DrawSubPage — clear screen and render sub-page (SAVE/LOAD slot list, or the
+; V38 preset matrix). Called from main loop when wSubDirty != 0. LCD re-enabled
+; on exit.
 DrawSubPage:
     xor a
     ld [wSubDirty], a
     call DisableLCD
-    ; Clear rows 0-10
+    ld a, [wSubPage]
+    cp 3
+    jp z, DrawMatrixPage        ; V38 matrix owns the whole screen
+    ; Clear rows 0-15 (V38.1: includes the hint rows so nothing bleeds between
+    ; sub-pages; rows 16-17 belong to the help system)
     ld hl, $9800
-    call BlankRow
-    ld hl, $9820
-    call BlankRow
-    ld hl, $9840
-    call BlankRow
-    ld hl, $9860
-    call BlankRow
-    ld hl, $9880
-    call BlankRow
-    ld hl, $98A0
-    call BlankRow
-    ld hl, $98C0
-    call BlankRow
-    ld hl, $98E0
-    call BlankRow
-    ld hl, $9900
-    call BlankRow
-    ld hl, $9920
-    call BlankRow
-    ld hl, $9940
-    call BlankRow
+    ld c, 16
+.dspClear:
+    push hl
+    call BlankRow               ; clobbers a, b
+    pop hl
+    ld de, $20
+    add hl, de
+    dec c
+    jr nz, .dspClear
     ; Draw title bar row 0 (20 inverted tiles)
     ld a, [wSubPage]
     cp 1
@@ -9150,14 +9197,171 @@ DrawSubPage:
     cp SAVE_SLOT_COUNT
     jr nz, .dspSlotLoop
     call DisableSRAM
+    ; V38.1: static button-hint row 13 (per list type)
+    ld a, [wSubPage]
+    cp 1
+    ld hl, SubPageSaveHintRow
+    jr z, .dspHint
+    ld hl, SubPageLoadHintRow
+.dspHint:
+    ld de, $99A0
+    ld b, 20
+.dspHintCopy:
+    ld a, [hli]
+    ld [de], a
+    inc de
+    dec b
+    jr nz, .dspHintCopy
     call HelpRowTick
     ld a, $91
     ldh [rLCDC], a
     ret
 
-; HandleSubPageInput — process joypad in save/load slot list.
+; DrawMatrixPage — render the V38 4×4 preset matrix. Entered from DrawSubPage
+; with the LCD already off; re-enables it on exit.
+; Cells: [marker][2 digits] at cols 2/7/12/17, screen rows 3/5/7/9.
+; Occupied = inverted digits, empty = plain digits. Cursor marker = ►, or ⏸
+; while an overwrite/delete confirm is armed (same idiom as the slot lists).
+DrawMatrixPage:
+    ; Clear rows 0-15 (rows 16-17 belong to the help system)
+    ld hl, $9800
+    ld c, 16
+.dmpClear:
+    push hl
+    call BlankRow               ; clobbers a, b; hl += 20
+    pop hl
+    ld de, $20
+    add hl, de
+    dec c
+    jr nz, .dmpClear
+    ; Title bar (20 inverted tiles) + inverted separator row 1
+    ld hl, SubPageMatrixTitleBar
+    ld de, $9800
+    ld b, 20
+.dmpTitle:
+    ld a, [hli]
+    ld [de], a
+    inc de
+    dec b
+    jr nz, .dmpTitle
+    ld hl, $9820
+    ld a, INV_TILE_BLANK
+    ld b, 20
+.dmpSep:
+    ld [hli], a
+    dec b
+    jr nz, .dmpSep
+    ; 16 cells
+    ld c, 0                     ; c = preset index
+.dmpCell:
+    call MatrixCellAddr         ; hl = marker address (preserves c)
+    ; marker column: ►/⏸ on the cursor cell, blank elsewhere
+    ld a, [wSubCursor]
+    cp c
+    jr nz, .dmpNoCursor
+    ld a, [wSubArmCounter]
+    and a
+    ld a, TILE_PAUSE
+    jr nz, .dmpMarker
+    ld a, TILE_PLAY
+    jr .dmpMarker
+.dmpNoCursor:
+    ld a, TILE_BLANK
+.dmpMarker:
+    ld [hli], a
+    ; digit base: inverted when occupied
+    push hl
+    ld b, 0
+    ld hl, wPresetOcc
+    add hl, bc
+    ld a, [hl]
+    pop hl
+    and a
+    ld b, TILE_DIGIT0
+    jr z, .dmpDigits
+    ld b, INV_TILE_DIGIT0
+.dmpDigits:
+    ; cell number c+1 as two digits (01..16)
+    ld a, c
+    inc a
+    ld d, 0
+    cp 10
+    jr c, .dmpTens
+    sub 10
+    inc d
+.dmpTens:
+    ld e, a                     ; e = units, d = tens
+    ld a, d
+    add b
+    ld [hli], a
+    ld a, e
+    add b
+    ld [hli], a
+    ; V38.1: dot after the digits marks the currently playing preset
+    ld a, [wPresetActive]
+    cp c
+    ld a, TILE_DOT
+    jr z, .dmpActive
+    ld a, TILE_BLANK
+.dmpActive:
+    ld [hl], a
+    inc c
+    ld a, c
+    cp PRESET_COUNT
+    jr nz, .dmpCell
+    ; Button hint rows (static): row 13 + row 15
+    ld hl, MatrixHintRow1
+    ld de, $99A0
+    ld b, 20
+.dmpHint1:
+    ld a, [hli]
+    ld [de], a
+    inc de
+    dec b
+    jr nz, .dmpHint1
+    ld hl, MatrixHintRow2
+    ld de, $99E0
+    ld b, 20
+.dmpHint2:
+    ld a, [hli]
+    ld [de], a
+    inc de
+    dec b
+    jr nz, .dmpHint2
+    call HelpRowTick
+    ld a, $91
+    ldh [rLCDC], a
+    ret
+
+; MatrixCellAddr — c = preset index → hl = VRAM address of the cell's marker.
+; Grid rows 3/5/7/9 = $9860 + row*$40; marker cols 1/6/11/16 = 1 + col*5.
+; Cell = [marker][digit][digit][active-dot] → last dot lands on col 19 (V38.1:
+; col-2 base put the last column's dot on invisible col 20).
+; Preserves c. Clobbers a, d, e.
+MatrixCellAddr:
+    ld a, c
+    and %00001100               ; row*4
+    swap a                      ; ×16 → row*$40
+    ld e, a
+    ld d, 0
+    ld hl, $9860 + 1
+    add hl, de
+    ld a, c
+    and %00000011               ; col
+    ld e, a
+    add a
+    add a                       ; col*4
+    add e                       ; col*5
+    ld e, a
+    add hl, de                  ; d still 0
+    ret
+
+; HandleSubPageInput — process joypad in save/load slot list or preset matrix.
 ; b = held buttons, c = new presses (same convention as HandleInput).
 HandleSubPageInput:
+    ld a, [wSubPage]
+    cp 3
+    jp z, HandleMatrixInput     ; V38 preset matrix owns its own input
     ; UP: move cursor up with wrap
     bit 2, c
     jr z, .hsiNoUp
@@ -9280,6 +9484,230 @@ SubPageLoadAction:
 .loadInvalid:
     ld a, 1
     ld [wSubDirty], a        ; force slot list repaint — slot now shows SLOT N
+    xor a
+    ld hl, HelpStr_EmptySlot
+    jp ShowHelpByIndex
+
+; =============================================================================
+; V38 Preset Matrix sub-page (wSubPage = 3)
+; =============================================================================
+
+; GetPresetOccPtr(a = preset 0..15) → hl = wPresetOcc + preset. Clobbers d, e.
+GetPresetOccPtr:
+    ld d, 0
+    ld e, a
+    ld hl, wPresetOcc
+    add hl, de
+    ret
+
+; HandleMatrixInput — joypad while the 4×4 preset matrix is on screen.
+; b = held buttons, c = new presses. Cursor: bits 3-2 = row, bits 1-0 = column.
+; A = save (2-press confirm on overwrite), B = load (1 press),
+; START = delete (2-press confirm), SELECT = back to CONTROLS.  (V38.1: A/B
+; swapped on user request — A saves, B loads.)
+; Any cursor move cancels an armed confirm (same idiom as the slot lists).
+HandleMatrixInput:
+    bit 2, c                    ; UP → row-1 (wraps)
+    jr z, .hmNoUp
+    ld a, [wSubCursor]
+    sub 4
+    and 15
+    jr .hmStoreCursor
+.hmNoUp:
+    bit 3, c                    ; DOWN → row+1 (wraps)
+    jr z, .hmNoDown
+    ld a, [wSubCursor]
+    add 4
+    and 15
+    jr .hmStoreCursor
+.hmNoDown:
+    bit 1, c                    ; LEFT → column-1 within the row (wraps)
+    jr z, .hmNoLeft
+    ld a, [wSubCursor]
+    ld d, a
+    and %00001100               ; keep row bits
+    ld e, a
+    ld a, d
+    dec a
+    and %00000011
+    or e
+    jr .hmStoreCursor
+.hmNoLeft:
+    bit 0, c                    ; RIGHT → column+1 within the row (wraps)
+    jr z, .hmButtons
+    ld a, [wSubCursor]
+    ld d, a
+    and %00001100
+    ld e, a
+    ld a, d
+    inc a
+    and %00000011
+    or e
+.hmStoreCursor:
+    ld [wSubCursor], a
+    xor a
+    ld [wSubArmCounter], a      ; cursor move cancels any armed confirm
+    ld [wSubArmAction], a
+    ld a, 1
+    ld [wSubDirty], a
+    ret
+.hmButtons:
+    bit 6, c                    ; SELECT → exit to CONTROLS
+    jr z, .hmNoSel
+    xor a
+    ld [wSubPage], a
+    ld [wSubArmCounter], a
+    ld [wSubArmAction], a
+    ld a, 1
+    ld [wPageRedraw], a
+    ret
+.hmNoSel:
+    bit 4, c                    ; A → save
+    jr z, .hmNoA
+    jp MatrixSavePreset
+.hmNoA:
+    bit 5, c                    ; B → load
+    jr z, .hmNoB
+    jp MatrixLoadPreset
+.hmNoB:
+    bit 7, c                    ; START → delete
+    ret z
+    jp MatrixDeletePreset
+
+; MatrixLoadPreset — B press: restore the selected preset into the live params.
+; One press by design (fast live switching); empty cells just flash EMPTY SLOT.
+MatrixLoadPreset:
+    xor a
+    ld [wSubArmCounter], a      ; a load always cancels a pending confirm
+    ld [wSubArmAction], a
+    ld a, [wSubCursor]
+    call GetPresetOccPtr
+    ld a, [hl]
+    and a
+    jr z, .mlEmpty
+    ld a, [wSubCursor]
+    ld [wPresetActive], a       ; V38.1: this cell is now the playing preset
+    ld a, [wSubCursor]
+    call GetPresetPtr
+    call RestoreState
+    call ApplyParamReconciliation
+    ; ApplyParamReconciliation set wPageRedraw — clear it, or the main loop
+    ; redraws the CONTROLS page and kicks us out of the matrix (.redrawPage9
+    ; resets wSubPage). Live use loads presets in quick succession; we stay on
+    ; the matrix until SELECT. The page repaint happens on exit anyway.
+    xor a
+    ld [wPageRedraw], a
+    ld hl, HelpStr_Loaded
+    call ShowHelpByIndex
+    ld a, 1
+    ld [wSubDirty], a           ; repaint (arm marker may need clearing)
+    ret
+.mlEmpty:
+    ld a, 1
+    ld [wSubDirty], a
+    xor a
+    ld hl, HelpStr_EmptySlot
+    jp ShowHelpByIndex
+
+; MatrixSavePreset — A press: snapshot live params into the selected cell.
+; Empty cell: immediate. Occupied cell: two-press confirm via wSubArmCounter
+; (armed action 1); the second A within SUB_ARM_FRAMES commits the overwrite.
+MatrixSavePreset:
+    ld a, [wSubArmAction]
+    cp 1
+    jr nz, .msFresh
+    ld a, [wSubArmCounter]
+    and a
+    jr z, .msFresh              ; arm expired → treat as a fresh press
+    xor a                       ; armed overwrite confirmed
+    ld [wSubArmCounter], a
+    ld [wSubArmAction], a
+    jr .msWrite
+.msFresh:
+    xor a
+    ld [wSubArmCounter], a      ; cancel any foreign arm (e.g. pending delete)
+    ld [wSubArmAction], a
+    ld a, [wSubCursor]
+    call GetPresetOccPtr
+    ld a, [hl]
+    and a
+    jr z, .msWrite              ; empty cell → save immediately
+    ld a, 1                     ; occupied → arm overwrite confirm
+    ld [wSubArmAction], a
+    ld a, SUB_ARM_FRAMES
+    ld [wSubArmCounter], a
+    ld a, 1
+    ld [wSubDirty], a
+    xor a
+    ld hl, HelpStr_PressAgainOverwr
+    jp ShowHelpByIndex
+.msWrite:
+    ld a, [wSubCursor]
+    call GetPresetPtr           ; hl = wPresetBuf slot
+    call CaptureCurrentState
+    ld a, [wSubCursor]
+    call GetPresetOccPtr
+    ld [hl], 1
+    ld a, [wSubCursor]
+    ld [wPresetActive], a       ; V38.1: cell now equals the live params
+    xor a
+    ld hl, HelpStr_Saved
+    call ShowHelpByIndex
+    ld a, 1
+    ld [wSubDirty], a
+    ret
+
+; MatrixDeletePreset — START press: clear the selected cell's occupied flag.
+; Two-press confirm (armed action 2); empty cells just flash EMPTY SLOT.
+MatrixDeletePreset:
+    ld a, [wSubArmAction]
+    cp 2
+    jr nz, .mdFresh
+    ld a, [wSubArmCounter]
+    and a
+    jr z, .mdFresh
+    xor a                       ; armed delete confirmed
+    ld [wSubArmCounter], a
+    ld [wSubArmAction], a
+    ld a, [wSubCursor]
+    call GetPresetOccPtr
+    ld [hl], 0
+    ; V38.1: deleting the active cell clears the playing marker
+    ld a, [wPresetActive]
+    ld d, a
+    ld a, [wSubCursor]
+    cp d
+    jr nz, .mdKeepActive
+    ld a, $FF
+    ld [wPresetActive], a
+.mdKeepActive:
+    xor a
+    ld hl, HelpStr_Deleted
+    call ShowHelpByIndex
+    ld a, 1
+    ld [wSubDirty], a
+    ret
+.mdFresh:
+    xor a
+    ld [wSubArmCounter], a
+    ld [wSubArmAction], a
+    ld a, [wSubCursor]
+    call GetPresetOccPtr
+    ld a, [hl]
+    and a
+    jr z, .mdEmpty
+    ld a, 2                     ; occupied → arm delete confirm
+    ld [wSubArmAction], a
+    ld a, SUB_ARM_FRAMES
+    ld [wSubArmCounter], a
+    ld a, 1
+    ld [wSubDirty], a
+    xor a
+    ld hl, HelpStr_PressAgainDelete
+    jp ShowHelpByIndex
+.mdEmpty:
+    ld a, 1
+    ld [wSubDirty], a
     xor a
     ld hl, HelpStr_EmptySlot
     jp ShowHelpByIndex
@@ -9538,7 +9966,7 @@ TonalMap_TRK:
     db $16, $15, $14, $13, $12, $11, $10, $07, $06, $05, $04, $00
 
 TonalMap_GML:
-    ; 12 selected NR43 values across the chromatic — "the gamelan voicing".
+    ; 12 hand-picked NR43 values across the chromatic — "the gamelan voicing".
     ; Seed: clusters of similar pitches, picking a coherent metallic palette.
     ; Entry 0 lifted from $44 → $36 after on-device tuning: $44 (clock-shift 4)
     ; produced sub-tonal rumble in 7B mode instead of a pitched ping. $36 sits
@@ -9547,7 +9975,7 @@ TonalMap_GML:
     db $36, $42, $40, $35, $33, $31, $25, $23, $21, $15, $13, $11
 
 TonalMap_INV:
-    ; Inverted: high note = low pitch (NR43 ascending). Custom mapping, not auto-mirrored.
+    ; Inverted: high note = low pitch (NR43 ascending). Hand-tuned, not auto-mirrored.
     db $00, $04, $05, $06, $07, $10, $11, $12, $13, $14, $15, $16
     db $17, $20, $21, $22, $23, $24, $25, $26, $27, $30, $31, $32
     db $33, $34, $35, $36, $37, $40, $41, $42, $43, $44, $45, $46
@@ -9731,17 +10159,17 @@ StartScreenData:
     db $85, $98, 10
     db TILE_G, TILE_I, TILE_T, TILE_H, TILE_U, TILE_B, TILE_DOT, TILE_C, TILE_O, TILE_M
 
-    ; Row 6, col 7: V0.37.1
+    ; Row 6, col 7: V0.38.2
     db $C7, $98, 7
     db TILE_V, TILE_DIGIT0 + VERSION_RELEASE, TILE_DOT
-    db TILE_DIGIT0 + 3, TILE_DIGIT0 + 7, TILE_DOT
+    db TILE_DIGIT0 + 3, TILE_DIGIT0 + 8, TILE_DOT
     db TILE_DIGIT0 + VERSION_FIX
 
-    ; Row 7, col 5: 2026.05.22
+    ; Row 7, col 5: 2026.07.07
     db $E5, $98, 10
     db TILE_DIGIT0 + 2, TILE_DIGIT0, TILE_DIGIT0 + 2, TILE_DIGIT0 + 6, TILE_DOT
-    db TILE_DIGIT0, TILE_DIGIT0 + 5, TILE_DOT
-    db TILE_DIGIT0 + 2, TILE_DIGIT0 + 2
+    db TILE_DIGIT0, TILE_DIGIT0 + 7, TILE_DOT
+    db TILE_DIGIT0, TILE_DIGIT0 + 7
 
     ; Row 9, col 2: A+LEFT FOR SOUND
     db $22, $99, 16
@@ -10607,8 +11035,6 @@ ControlsMixerPage:
     ; Terminator
     db $00, $00, 0
 
-; V32: ControlsPage9 split into sub-tables so UNDO/REDO rows can be drawn
-; conditionally (hidden when the respective stack is empty).
 ControlsPage9_Base:
     ; Row 0: title bar "CONTROLS 10/10" (inverted)
     db $00, $98, 20
@@ -10637,19 +11063,11 @@ ControlsPage9_Base:
     db $C1, $98, 13
     db TILE_R, TILE_N, TILE_D, TILE_BLANK, TILE_F, TILE_X, TILE_BLANK, TILE_BLANK, TILE_BLANK, TILE_S, TILE_T, TILE_PLUS, TILE_DN_ARROW
 
-    ; Terminator
-    db $00, $00, 0
-
-ControlsPage9_UndoRow:
-    ; Row 7, cols 1-13: "UNDO" label + "ST+←" hint (drawn only when undo stack non-empty)
+    ; Row 7, cols 1-13: "PRESET" label + "A+→" hint (V38 preset matrix)
     db $E1, $98, 13
-    db TILE_U, TILE_N, TILE_D, TILE_O, TILE_BLANK, TILE_BLANK, TILE_BLANK, TILE_BLANK, TILE_BLANK, TILE_S, TILE_T, TILE_PLUS, TILE_LF_ARROW
-    db $00, $00, 0
+    db TILE_P, TILE_R, TILE_E, TILE_S, TILE_E, TILE_T, TILE_BLANK, TILE_BLANK, TILE_BLANK, TILE_BLANK, TILE_A, TILE_PLUS, TILE_RT_ARROW
 
-ControlsPage9_RedoRow:
-    ; Row 8, cols 1-13: "REDO" label + "ST+→" hint (drawn only when redo stack non-empty)
-    db $01, $99, 13
-    db TILE_R, TILE_E, TILE_D, TILE_O, TILE_BLANK, TILE_BLANK, TILE_BLANK, TILE_BLANK, TILE_BLANK, TILE_S, TILE_T, TILE_PLUS, TILE_RT_ARROW
+    ; Terminator
     db $00, $00, 0
 
 ; Sub-page title bars (20 inverted tiles each)
@@ -10664,6 +11082,40 @@ SubPageLoadTitleBar:
     db INV_TILE_L, INV_TILE_O, INV_TILE_A, INV_TILE_D, INV_TILE_BLANK
     db INV_TILE_L, INV_TILE_I, INV_TILE_S, INV_TILE_T
     db INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK
+
+; V38 preset matrix title bar (20 inverted tiles): "PRESETS"
+SubPageMatrixTitleBar:
+    db INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK
+    db INV_TILE_P, INV_TILE_R, INV_TILE_E, INV_TILE_S, INV_TILE_E, INV_TILE_T, INV_TILE_S
+    db INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK, INV_TILE_BLANK
+
+; V38 preset matrix static hint rows (20 tiles each; V38.1: A=save, B=load)
+MatrixHintRow1:
+    ; " A SAV B LOD ST DEL "
+    db TILE_BLANK
+    db TILE_A, TILE_BLANK, TILE_S, TILE_A, TILE_V, TILE_BLANK
+    db TILE_B, TILE_BLANK, TILE_L, TILE_O, TILE_D, TILE_BLANK
+    db TILE_S, TILE_T, TILE_BLANK, TILE_D, TILE_E, TILE_L
+    db TILE_BLANK
+MatrixHintRow2:
+    ; " SEL BACK"
+    db TILE_BLANK
+    db TILE_S, TILE_E, TILE_L, TILE_BLANK, TILE_B, TILE_A, TILE_C, TILE_K
+    ds 11, TILE_BLANK
+
+; V38.1 slot-list static hint rows (20 tiles each, row 13)
+SubPageSaveHintRow:
+    ; " A SAV B BACK"
+    db TILE_BLANK
+    db TILE_A, TILE_BLANK, TILE_S, TILE_A, TILE_V, TILE_BLANK
+    db TILE_B, TILE_BLANK, TILE_B, TILE_A, TILE_C, TILE_K
+    ds 7, TILE_BLANK
+SubPageLoadHintRow:
+    ; " A LOD B BACK"
+    db TILE_BLANK
+    db TILE_A, TILE_BLANK, TILE_L, TILE_O, TILE_D, TILE_BLANK
+    db TILE_B, TILE_BLANK, TILE_B, TILE_A, TILE_C, TILE_K
+    ds 7, TILE_BLANK
 
 ; --- Speed Table (32 entries, logarithmic spacing) -------------------------------
 
@@ -11305,25 +11757,16 @@ HelpStr_RndMild:
     db TILE_K, TILE_E, TILE_P, TILE_T, TILE_BLANK, TILE_K, TILE_E, TILE_Y, TILE_PLUS, TILE_T, TILE_E, TILE_M, TILE_P, TILE_O
     ds 6, TILE_BLANK
 
-; --- V31.3 Undo/Redo history help strings (each exactly HELP_LEN = 20 bytes) ---
-HelpStr_Undo:
-    ; "UNDO" (4) + 16 blanks = 20
-    db TILE_U, TILE_N, TILE_D, TILE_O
-    ds 16, TILE_BLANK
+; --- V38 preset matrix help strings (each exactly HELP_LEN = 20 bytes) ---
+HelpStr_PressAgainDelete:
+    ; "PRESS ST AGAIN DEL" (18) + 2 blanks = 20
+    db TILE_P, TILE_R, TILE_E, TILE_S, TILE_S, TILE_BLANK, TILE_S, TILE_T, TILE_BLANK
+    db TILE_A, TILE_G, TILE_A, TILE_I, TILE_N, TILE_BLANK, TILE_D, TILE_E, TILE_L
+    ds 2, TILE_BLANK
 
-HelpStr_Redo:
-    ; "REDO" (4) + 16 blanks = 20
-    db TILE_R, TILE_E, TILE_D, TILE_O
-    ds 16, TILE_BLANK
-
-HelpStr_NoUndo:
-    ; "NO HISTORY" (10) + 10 blanks = 20
-    db TILE_N, TILE_O, TILE_BLANK, TILE_H, TILE_I, TILE_S, TILE_T, TILE_O, TILE_R, TILE_Y
-    ds 10, TILE_BLANK
-
-HelpStr_NoRedo:
-    ; "NO REDO" (7) + 13 blanks = 20
-    db TILE_N, TILE_O, TILE_BLANK, TILE_R, TILE_E, TILE_D, TILE_O
+HelpStr_Deleted:
+    ; "DELETED" (7) + 13 blanks = 20
+    db TILE_D, TILE_E, TILE_L, TILE_E, TILE_T, TILE_E, TILE_D
     ds 13, TILE_BLANK
 
 ; --- V32 MUTE CH4 help strings (each exactly HELP_LEN = 20 bytes) ---
