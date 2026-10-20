@@ -12,7 +12,7 @@ Aleksi Eeben, the author of GB Electric Drum, once answered my
 request for source code with "It's a good practice. Go program it
 yourself." With DMGARP I finally did it.
 
-**[Download latest ROM (V38.2)](https://github.com/kennhartwig/dmgarp/releases/latest/download/dmg-arp.gb)**
+**[Download latest ROM (V38.5)](https://github.com/kennhartwig/dmgarp/releases/latest/download/dmg-arp.gb)**
 
 ---
 

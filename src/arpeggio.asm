@@ -136,7 +136,7 @@ DEF ARP_BANK_COUNT   EQU 28
 DEF SCALE_ENTRY_SIZE EQU 10
 DEF VERSION_RELEASE  EQU 0
 DEF VERSION_FEATURE  EQU 38
-DEF VERSION_FIX      EQU 2
+DEF VERSION_FIX      EQU 5
 DEF DEFAULT_SPEED    EQU 11
 DEF MIN_SPEED        EQU 0
 DEF MAX_SPEED        EQU 31
@@ -472,6 +472,14 @@ wPresetActive:       ds 1                       ; V38.1: last loaded/saved cell 
 SECTION "Main", ROM0[$0150]
 
 EntryPoint:
+    di                      ; defense-in-depth: don't rely on the boot ROM's
+                            ; IME state
+    ld sp, $DFF0            ; ditto for SP=$FFFE
+    ld a, 1                 ; select ROM bank 1 before the first ROMX read
+    ld [$2000], a           ; (LoadTiles): the cart's power-on bank is undefined.
+                            ; One modded DMG with an EMS 64M cart mapped bank 0
+                            ; in 7 of 8 starts and showed a blank or garbled
+                            ; screen (BOOT RULE, 2026-10-20)
     call WaitVBlank
     call DisableLCD
     call LoadTiles
@@ -5092,6 +5100,15 @@ PlayCurrentNote:
     jr nz, .ch3Running
 
     ; --- First trigger: mute → trigger → unmute ---
+    ; NR30 off/on immediately before the trigger only (the DMG Wave-RAM
+    ; corruption fix, 2026-08-05) -- the unconditional
+    ; NR30=$80 above just ensures the DAC is enabled on every call (both
+    ; branches); this is the genuine off-then-on restart, confined to the
+    ; branch that actually triggers, never the .ch3Running no-trigger path.
+    xor a
+    ldh [rNR30], a
+    ld a, $80
+    ldh [rNR30], a
     xor a
     ldh [rNR32], a          ; mute for clean trigger
     ld a, e
@@ -10159,17 +10176,17 @@ StartScreenData:
     db $85, $98, 10
     db TILE_G, TILE_I, TILE_T, TILE_H, TILE_U, TILE_B, TILE_DOT, TILE_C, TILE_O, TILE_M
 
-    ; Row 6, col 7: V0.38.2
+    ; Row 6, col 7: V0.38.<VERSION_FIX>
     db $C7, $98, 7
     db TILE_V, TILE_DIGIT0 + VERSION_RELEASE, TILE_DOT
     db TILE_DIGIT0 + 3, TILE_DIGIT0 + 8, TILE_DOT
     db TILE_DIGIT0 + VERSION_FIX
 
-    ; Row 7, col 5: 2026.07.07
+    ; Row 7, col 5: 2026.10.20
     db $E5, $98, 10
     db TILE_DIGIT0 + 2, TILE_DIGIT0, TILE_DIGIT0 + 2, TILE_DIGIT0 + 6, TILE_DOT
-    db TILE_DIGIT0, TILE_DIGIT0 + 7, TILE_DOT
-    db TILE_DIGIT0, TILE_DIGIT0 + 7
+    db TILE_DIGIT0 + 1, TILE_DIGIT0, TILE_DOT
+    db TILE_DIGIT0 + 2, TILE_DIGIT0
 
     ; Row 9, col 2: A+LEFT FOR SOUND
     db $22, $99, 16

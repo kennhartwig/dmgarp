@@ -322,7 +322,7 @@ a real instrument.
 
 ### ROM section layout for 32 KB MBC1 ROMs
 - RGBDS does not enforce a `ROM0` / `ROMX` split when only ROM0 sections exist; the linker places everything sequentially in the 32 KB address space. However, once any `ROMX` section is declared, ROM0 is restricted to `$0000-$3FFF` and ROMX to `$4000-$7FFF`.
-- For a 32 KB MBC1 ROM (2 banks), bank 1 is **always mapped** at `$4000-$7FFF` — there is no bank switching. Code in bank 0 can freely read data or call subroutines at `$4000+` via normal 16-bit addresses. Moving large read-only data tables from `ROM0` to `ROMX, BANK[1]` is a safe way to free ROM0 space without adding bank-switch complexity.
+- For a 32 KB MBC1 ROM (2 banks), there is no bank switching **after one write at boot** — but bank 1 is **not** guaranteed to be mapped at `$4000-$7FFF` at power-on. The MBC's bank register starts undefined: one modded DMG with an EMS 64M flash cart mapped bank 0 there in 7 of 8 starts, and the ROM showed a blank or garbled screen. Write `ld a, 1` / `ld [$2000], a` right after `ld sp`, before the first read of `$4000+`. After that, bank 1 stays mapped, and code in bank 0 can freely read data or call subroutines at `$4000+` via normal 16-bit addresses. Moving large read-only data tables from `ROM0` to `ROMX, BANK[1]` is a safe way to free ROM0 space without adding bank-switch complexity.
 - Data references (`ld hl, Label`) work correctly with ROMX labels because `hl` is a full 16-bit register and the CPU maps the entire `$0000-$7FFF` space unconditionally.
 
 ### Sub-page input intercept pattern
