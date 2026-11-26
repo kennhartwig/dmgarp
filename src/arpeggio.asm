@@ -136,7 +136,7 @@ DEF ARP_BANK_COUNT   EQU 28
 DEF SCALE_ENTRY_SIZE EQU 10
 DEF VERSION_RELEASE  EQU 0
 DEF VERSION_FEATURE  EQU 38
-DEF VERSION_FIX      EQU 5
+DEF VERSION_FIX      EQU 6
 DEF DEFAULT_SPEED    EQU 11
 DEF MIN_SPEED        EQU 0
 DEF MAX_SPEED        EQU 31
@@ -8275,21 +8275,17 @@ EnsureSRAM:
     cp SAVE_SCHEMA_VERSION
     jr z, .sramOk
 .doInit:
-    ld hl, $A000
-    ld a, SRAM_MAGIC_0
-    ld [hli], a
-    ld a, SRAM_MAGIC_1
-    ld [hli], a
-    ld a, SRAM_MAGIC_2
-    ld [hli], a
-    ld a, SRAM_MAGIC_3
-    ld [hli], a
-    ld a, SAVE_SCHEMA_VERSION
-    ld [hli], a
+    ; 0.38.6: wipe FIRST, publish magic+schema LAST (rule A8, as DMG5D 0.40.0).
+    ; The old order wrote the new header first; a power cut during the wipe then
+    ; left a valid header over old slot/preset flags, and the next boot took the
+    ; .sramOk path and loaded old-schema bytes under the new meaning (range
+    ; validation catches only out-of-range values). Now an interrupted wipe
+    ; leaves the old header in place, which the next boot still rejects.
+    ld hl, $A005
     xor a
     ld [hli], a
     ld [hli], a
-    ld [hli], a         ; reserved $A005-$A007
+    ld [hl], a          ; reserved $A005-$A007
     ; Zero all occupied flags (one per slot)
     ld hl, $A008
     ld de, SAVE_SLOT_SIZE
@@ -8319,6 +8315,18 @@ EnsureSRAM:
     jr nz, .clearMatrix
     xor a
     ld [$4000], a               ; back to bank 0
+    ; Publish the header last — only now is the wipe complete.
+    ld hl, $A000
+    ld a, SRAM_MAGIC_0
+    ld [hli], a
+    ld a, SRAM_MAGIC_1
+    ld [hli], a
+    ld a, SRAM_MAGIC_2
+    ld [hli], a
+    ld a, SRAM_MAGIC_3
+    ld [hli], a
+    ld a, SAVE_SCHEMA_VERSION
+    ld [hl], a
 .sramOk:
     call DisableSRAM
     ret
@@ -10182,11 +10190,11 @@ StartScreenData:
     db TILE_DIGIT0 + 3, TILE_DIGIT0 + 8, TILE_DOT
     db TILE_DIGIT0 + VERSION_FIX
 
-    ; Row 7, col 5: 2026.10.20
+    ; Row 7, col 5: 2026.11.26
     db $E5, $98, 10
     db TILE_DIGIT0 + 2, TILE_DIGIT0, TILE_DIGIT0 + 2, TILE_DIGIT0 + 6, TILE_DOT
-    db TILE_DIGIT0 + 1, TILE_DIGIT0, TILE_DOT
-    db TILE_DIGIT0 + 2, TILE_DIGIT0
+    db TILE_DIGIT0 + 1, TILE_DIGIT0 + 1, TILE_DOT
+    db TILE_DIGIT0 + 2, TILE_DIGIT0 + 6
 
     ; Row 9, col 2: A+LEFT FOR SOUND
     db $22, $99, 16

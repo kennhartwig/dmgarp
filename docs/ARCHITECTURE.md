@@ -4,7 +4,7 @@ Starting map for the codebase, audio engine, and key symbols. Line numbers
 drift as the code evolves — treat them as approximate pointers and verify with
 `grep` before relying on a specific location.
 
-**Current version:** V0.38.2  
+**Current version:** V0.38.6  
 **Target hardware:** Original DMG Game Boy (1989). No CGB-specific features.  
 **Toolchain:** RGBDS v1.0.1
 
@@ -277,7 +277,9 @@ range-validate every param byte (slots and each occupied preset) against
 `SaveParamRangeTable` before touching WRAM.
 
 `EnsureSRAM` validates magic + schema on boot; wipes occupied flags
-(slot and preset, not param bytes) on mismatch. SRAM must be explicitly
+(slot and preset, not param bytes) on mismatch. The wipe runs first and the
+new magic + schema are written last (V38.6), so a power cut during the wipe
+leaves the old header, and the next boot wipes again. SRAM must be explicitly
 enabled/disabled around every access via the MBC1 enable register.
 
 **Schema version must be incremented whenever `SaveParamTable` changes** (any
